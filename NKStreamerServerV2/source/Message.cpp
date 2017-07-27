@@ -99,3 +99,11 @@ char Message::GetFirstByte() const
 	}
 	return 0;
 }
+
+Message::~Message()
+{
+	if(Received > 5)
+	{
+		free(this->Content);
+	}
+}

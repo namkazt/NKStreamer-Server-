@@ -3,12 +3,17 @@
 #include <evpp/buffer.h>
 #include <evpp/tcp_conn.h>
 
-#include <Magick++/Magick++.h>
+#include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/opencv.hpp>
+#include <turbojpeg.h>
+
 #include "ScreenCapture.h"
 #include "Message.h"
 #include <libconfig.h++>
-#include <sys/types.h>
 #include <fakeinput.hpp>
+
 
 #include <winsock2.h>
 #include <stdio.h>
@@ -20,8 +25,10 @@ using namespace libconfig;
 #define SIZE_3DS_RGB 400*3*240
 #define SIZE_3DS_RGB565 400*2*240
 
-SL::Screen_Capture::ScreenCaptureManager framgrabber;
-int connectionCount;
+//-------------------------------------------------
+// CONFIGURATION VARIABLES
+// should not be const to be edit via client on runtime
+//-------------------------------------------------
 
 //-------------------------------------------------
 // Frame quality ( JPEG )
@@ -31,7 +38,7 @@ int imageQuality = 40;
 //-------------------------------------------------
 // Capture FPS
 //-------------------------------------------------
-int streamFPS = 24;
+int streamFPS = 16;
 
 //-------------------------------------------------
 // this option only good for play game ( that need mininum delay )
@@ -43,24 +50,45 @@ bool needWaitForReceived = true;
 // When "needWaitForReceived" to avoid lag too long and save time when transfer then
 // we only wait "WAIT_FRAME" if client still not received we start sending frame.
 //-------------------------------------------------
-#define WAIT_FRAME MAXDWORD64
+int maxFrameToWait = INT_MAX;
 
-bool isStreamingDesktop = false;
-int currentActiveConnect = -1;
-volatile int currentFrame = 0;
-int currentWaitFrame = 0;
-Message* receivedMessage = nullptr;
+//-------------------------------------------------
+// Split frame mode
+//-------------------------------------------------
+bool splitFrameMode = false;
 
-Magick::Image *lastImage;
+//-------------------------------------------------
+// Private variables
+//-------------------------------------------------
 
 struct ClientConnection
 {
 	evpp::TCPConnPtr conn;
 	bool received;
 	bool isMainConnect;
+	// for split frame mode
+	int currentFrame;
+	char pieceIndex;
 };
 
 
+bool isStreamingDesktop = false;
+int currentActiveConnect = -1;
+int currentFrame = 0;
+int currentWaitFrame = 0;
+
+Message* receivedMessage = nullptr;
+std::mutex msgMutex;
+
+SL::Screen_Capture::ScreenCaptureManager framgrabber;
+int connectionCount;
+std::vector<ClientConnection> conns;
+
+std::map<int, std::vector<char*>> framePieceCached;
+std::map<int, int> framePieceState;
+int framePieceNormal = 0;
+int framePieceLast = 0;
+char totalConn;
 //=================================================================================
 // KEY MAPPING
 //=================================================================================
@@ -217,17 +245,18 @@ void SendImageDataToClient(const SL::Screen_Capture::Image& img, evpp::TCPConnPt
 	//-----------------------------------------------------------------------------
 	// encrypt to JPEG small
 	//-----------------------------------------------------------------------------
-	Magick::Image mImg = Magick::Image(img.Bounds.right, img.Bounds.bottom, "RGB", Magick::CharPixel, imgbuffer);
-	mImg.magick("JPEG");
-	mImg.quality(imageQuality);
-	mImg.thumbnail(Magick::Geometry("400x240!"));
-	Magick::Blob imgBlob;
-	mImg.write(&imgBlob);
+	cv::Mat rawImg = cv::Mat(cv::Size(Width(img), Height(img)), CV_8UC3, imgbuffer);
+	cv::Mat scaledImg;
+	cv::resize(rawImg, scaledImg, cv::Size(400, 240));
+	long unsigned int _jpegSize = 0;
+	unsigned char* _compressedImage = NULL;
+	tjhandle _jpegCompressor = tjInitCompress();
+	tjCompress2(_jpegCompressor, scaledImg.data, 400, 0, 240, TJPF_RGB, &_compressedImage, &_jpegSize, TJSAMP_444, imageQuality, TJFLAG_FASTDCT);
 	//-----------------------------------------------------------------------------
 	// build Message
 	//-----------------------------------------------------------------------------
 	// header size = 1 + 4 + 4 = 9 -> 1 byte code + 4 bytes content size + 4 bytes frame
-	int totalSize = imgBlob.length() + 9;
+	int totalSize = _jpegSize + 9;
 	Message* msg = new Message();
 	msg->MessageCode = IMAGE_PACKET;
 	msg->ContentSize = totalSize;
@@ -249,11 +278,12 @@ void SendImageDataToClient(const SL::Screen_Capture::Image& img, evpp::TCPConnPt
 	*data++ = currentFrame >> 16;
 	*data++ = currentFrame >> 24;
 	//--------------------------------------
-	memcpy(data, imgBlob.data(), imgBlob.length());
-	std::cout << "Frame Index: " << currentFrame << std::endl;
+	memcpy(data, _compressedImage, _jpegSize);
+	std::cout << "Frame Index: " << currentFrame << " MSG size: " << totalSize << std::endl;
 	//-----------------------------------------------------------------------------
 	// Send message to all client
 	//-----------------------------------------------------------------------------
+	//if (conn3ds != nullptr) conn3ds->Send(msgContent, totalSize);
 	conn3ds->Send(msgContent, totalSize);
 	//-----------------------------------------------------------------------------
 	// advance to next frame or recircle back to 0 when reach max.
@@ -268,13 +298,140 @@ void SendImageDataToClient(const SL::Screen_Capture::Image& img, evpp::TCPConnPt
 	delete msg;
 	//-----------------------------------------------------------------------------
 	free(imgbuffer);
+	tjDestroy(_jpegCompressor);
+	tjFree(_compressedImage);
+}
+
+//-----------------------------------------------------------------------------
+// return False if frame not found or not finish
+// return True if frame sent and erased
+bool CleanFrameCached(int frameIndex)
+{
+	if(framePieceState.find(frameIndex) != framePieceState.end())
+	{
+		if(framePieceState[frameIndex] == totalConn)
+		{
+			for(char i = 0; i < totalConn; i++)
+			{
+				free(framePieceCached[frameIndex][i]);
+			}
+			std::vector<char*>().swap(framePieceCached[frameIndex]);
+			framePieceCached.erase(frameIndex);
+			framePieceState.erase(frameIndex);
+			return true;
+		}
+		return false;
+	}
+	return false;
+}
+
+int PopOutOnePiece(int frameIndex)
+{
+	if (framePieceState.find(frameIndex) != framePieceState.end())
+	{
+		if (framePieceState[frameIndex] == totalConn) return -1;
+		int ret = framePieceState[frameIndex];
+		framePieceState[frameIndex]++;
+		return ret;
+	} 
+	return -1;
+}
+
+void GetFramePieces(const SL::Screen_Capture::Image& img)
+{
+	//-----------------------------------------------------------------------------
+	// advance to next frame or recircle back to 0 when reach max.
+	currentFrame++;
+	if (currentFrame >= INT32_MAX - 1)
+		currentFrame = 0;
+
+	//-----------------------------------------------------------------------------
+	// Extract image data
+	//-----------------------------------------------------------------------------
+	auto size = RowStride(img) * Height(img);
+	char* imgbuffer = (char*)malloc(size);
+	int result = ExtractAndConvertToRGB(img, imgbuffer);
+	if (result == -1)
+	{
+		free(imgbuffer);
+		return;
+	}
+	//-----------------------------------------------------------------------------
+	// encrypt to JPEG small
+	//-----------------------------------------------------------------------------
+	cv::Mat rawImg = cv::Mat(cv::Size(Width(img), Height(img)), CV_8UC3, imgbuffer);
+	cv::Mat scaledImg;
+	cv::resize(rawImg, scaledImg, cv::Size(400, 240));
+	long unsigned int _jpegSize = 0;
+	unsigned char* _compressedImage = NULL;
+	tjhandle _jpegCompressor = tjInitCompress();
+	tjCompress2(_jpegCompressor, scaledImg.data, 400, 0, 240, TJPF_RGB, &_compressedImage, &_jpegSize, TJSAMP_444, imageQuality, TJFLAG_FASTDCT);
+
+	//-----------------------------------------------------------------------------
+	// collect split information
+	//-----------------------------------------------------------------------------
+	framePieceNormal = _jpegSize / totalConn;
+	framePieceLast = _jpegSize - (framePieceNormal * totalConn) + framePieceNormal;
+
+	std::vector<char*> frameCached;
+	for(char i = 0; i < totalConn; ++i)
+	{
+		//-----------------------------------------------------------------------------
+		// build Message
+		//-----------------------------------------------------------------------------
+		// header size = 1 + 4 + 4 = 9 -> 1 byte code + 4 bytes content size + 4 bytes frame
+		int totalSize = 11;
+		if (i == totalConn - 1) totalSize += framePieceLast;
+		else totalSize += framePieceNormal;
+		//--------------------------------------
+		Message* msg = new Message();
+		msg->MessageCode = IMAGE_PACKET;
+		msg->ContentSize = totalSize;
+		char* msgContent = (char*)malloc(sizeof(char) * totalSize);
+		//--------------------------------------
+		char* data = msgContent;
+		*data++ = msg->MessageCode;
+		//--------------------------------------
+		// 4 bytes for content size
+		*data++ = msg->ContentSize;
+		*data++ = msg->ContentSize >> 8;
+		*data++ = msg->ContentSize >> 16;
+		*data++ = msg->ContentSize >> 24;
+		//--------------------------------------
+		// 4 bytes for frame index
+		//--------------------------------------
+		*data++ = currentFrame;
+		*data++ = currentFrame >> 8;
+		*data++ = currentFrame >> 16;
+		*data++ = currentFrame >> 24;
+		//--------------------------------------
+		// 1 byte for total part
+		//--------------------------------------
+		*data++ = totalConn;
+		//--------------------------------------
+		// 1 byte for part index
+		//--------------------------------------
+		*data++ = i;
+		//--------------------------------------
+		if (i == totalConn - 1) memcpy(data, _compressedImage + (i*framePieceNormal), framePieceLast);
+		else memcpy(data, _compressedImage + (i*framePieceNormal), framePieceNormal);
+		//--------------------------------------
+		// Store the msg content of this frame.
+		frameCached.push_back(msgContent);
+	}
+	//--------------------------------------
+	framePieceCached[currentFrame] = frameCached;
+	framePieceState[currentFrame] = 0;
+	//-----------------------------------------------------------------------------
+	free(imgbuffer);
 }
 
 void ProcessInput(const Message* message, ClientConnection* clientConnect)
 {
 	//------------------------------------------------------------
-	// input code from 70 to 85 is normal input mapping 
-	if (message->MessageCode >= char(70) && message->MessageCode <= char(85)) {
+	// input code from 70 to 85 is normal input mapping
+	if (message->MessageCode >= char(70) && message->MessageCode <= char(85))
+	{
 		char state = message->GetFirstByte();
 		if (state == char(1))
 		{
@@ -284,7 +441,8 @@ void ProcessInput(const Message* message, ClientConnection* clientConnect)
 		{
 			FakeInput::Keyboard::releaseKey(MappingProfiles[currentProfile][message->MessageCode]);
 		}
-	}else if (message->MessageCode > char(85) && message->MessageCode <= char(90))
+	}
+	else if (message->MessageCode > char(85) && message->MessageCode <= char(90))
 	{
 		//-----------------------------------------------------
 		// input code from 86 to 90 is for circle pad
@@ -299,16 +457,20 @@ void ProcessMessage(const Message* message, ClientConnection* clientConnect)
 	{
 	case START_STREAM_PACKET:
 		{
+		std::cout << "Client start streaming" << std::endl;
+			totalConn = conns.size();
 			//---------------------------------
 			// Client what start the stream is main
 			//---------------------------------
 			clientConnect->isMainConnect = true;
 			isStreamingDesktop = true;
+			currentFrame = 0;
 			if (framgrabber.isPaused()) framgrabber.resume();
 			break;
 		}
 	case STOP_STREAM_PACKET:
 		{
+		std::cout << "Client stop streaming" << std::endl;
 			//---------------------------------
 			// Only main client can stop stream
 			//---------------------------------
@@ -319,6 +481,7 @@ void ProcessMessage(const Message* message, ClientConnection* clientConnect)
 		}
 	case IMAGE_RECEIVED_PACKET:
 		{
+		
 			clientConnect->received = true;
 			break;
 		}
@@ -336,6 +499,7 @@ void ProcessMessage(const Message* message, ClientConnection* clientConnect)
 
 void ProcessData(const char* buffer, size_t lenght, ClientConnection* clientConnect)
 {
+	msgMutex.lock();
 	if (receivedMessage == nullptr) receivedMessage = new Message();
 	int cutOffset = receivedMessage->ReadMessageFromData(buffer, lenght);
 	if (cutOffset >= 0)
@@ -354,8 +518,11 @@ void ProcessData(const char* buffer, size_t lenght, ClientConnection* clientConn
 			memcpy(bufferLeft, buffer + cutOffset, sizeLeft);
 
 			ProcessData(bufferLeft, sizeLeft, clientConnect);
+
+			free(bufferLeft);
 		}
 	}
+	msgMutex.unlock();
 }
 
 void GetIPAddress()
@@ -387,11 +554,8 @@ void GetIPAddress()
 
 int main(int argc, char** argv)
 {
-	
-
 	google::InitGoogleLogging("NKStreamerServer");
 	google::SetCommandLineOption("GLOG_minloglevel", "2");
-
 
 	//===========================================================================
 	// Config
@@ -426,7 +590,7 @@ int main(int argc, char** argv)
 		const Setting& root = serverCfg.getRoot();
 		//===============================
 		// load input profiles
-		const Setting &inputProfiles = root["input"];
+		const Setting& inputProfiles = root["input"];
 		int inputCount = inputProfiles.getLength();
 		for (int i = 0; i < inputCount; ++i)
 		{
@@ -436,7 +600,7 @@ int main(int argc, char** argv)
 			std::string btn_L, btn_R, btn_ZL, btn_ZR;
 			std::string btn_START, btn_SELECT;
 
-			if(!(inputProfiles[i].lookupValue("name", inputName) &&
+			if (!(inputProfiles[i].lookupValue("name", inputName) &&
 				inputProfiles[i].lookupValue("btn_A", btn_A) &&
 				inputProfiles[i].lookupValue("btn_B", btn_B) &&
 				inputProfiles[i].lookupValue("btn_X", btn_X) &&
@@ -448,7 +612,7 @@ int main(int argc, char** argv)
 				inputProfiles[i].lookupValue("btn_L", btn_L) &&
 				inputProfiles[i].lookupValue("btn_R", btn_R) &&
 				inputProfiles[i].lookupValue("btn_ZL", btn_ZL) &&
-				inputProfiles[i].lookupValue("btn_ZR", btn_ZR) && 
+				inputProfiles[i].lookupValue("btn_ZR", btn_ZR) &&
 				inputProfiles[i].lookupValue("btn_START", btn_START) &&
 				inputProfiles[i].lookupValue("btn_SELECT", btn_SELECT)))
 			{
@@ -481,22 +645,11 @@ int main(int argc, char** argv)
 		return (EXIT_FAILURE);
 	}
 
-	if(currentProfile == "")
+	if (currentProfile == "")
 	{
 		std::cout << "Need at least 1 input profile in config." << std::endl;
 		return (EXIT_FAILURE);
 	}
-
-	//===========================================================================
-	// Magick
-	//===========================================================================
-
-	Magick::InitializeMagick(*argv);
-	std::cout << "Init Magick : Successfully" << std::endl;
-	//===========================================================================
-	// Server Define
-	//===========================================================================
-	std::vector<ClientConnection> conns;
 
 	//===========================================================================
 	framgrabber = SL::Screen_Capture::CreateScreeCapture([&cfgMonitorIndex]()
@@ -506,54 +659,76 @@ int main(int argc, char** argv)
 				if (cfgMonitorIndex >= mons.size()) cfgMonitorIndex = 0;
 				selectedMonitor.push_back(mons[cfgMonitorIndex]);
 				return selectedMonitor;
-			}).onFrameChanged([&](const SL::Screen_Capture::Image& img, const SL::Screen_Capture::Monitor& monitor)
-				  {
-				  }).onNewFrame([&](const SL::Screen_Capture::Image& img, const SL::Screen_Capture::Monitor& monitor)
-				  {
-					  //TestImageData(img);
+			}).onNewFrame([&](const SL::Screen_Capture::Image& img, const SL::Screen_Capture::Monitor& monitor)
+				{
+				if (conns.size() == 0) return;
+				if (!isStreamingDesktop) return;
+				//===========================================================================
+				// check for active connect valid
+				if (currentActiveConnect == -1)
+				{
+					if (conns.size() > 0) currentActiveConnect = 0;
+					else return;
+				}
+				if (currentActiveConnect >= conns.size()) currentActiveConnect = 0;
+				//===========================================================================
+				// Split frame mode
+				if (splitFrameMode)
+				{
+					// loop in each conn and check
+					for (int i = 0; i < totalConn; i++)
+					{
+						// send this part of
+						if (conns[i].received)
+						{
+							int currentPieceIdx = PopOutOnePiece(currentFrame);
+							if (currentPieceIdx == -1) {
+								CleanFrameCached(currentFrame);
+								GetFramePieces(img);
+								std::cout << "[New Frame] Frame: " << currentFrame << std::endl;
+								currentPieceIdx = PopOutOnePiece(currentFrame);
+							}
+						
+							conns[i].received = false;
+							conns[i].currentFrame = currentFrame;
+							conns[i].pieceIndex = currentPieceIdx;
+							int size = (currentPieceIdx == totalConn - 1 ? framePieceLast : framePieceNormal) + 11;
+							conns[i].conn->Send(framePieceCached[currentFrame][currentPieceIdx], size);
+							std::cout << "[Peak] piece index: " << currentPieceIdx << " in frame: " << currentFrame << " size: " << size << std::endl;
+						}
+					}
+					return;
+				}
+				//===========================================================================
+				// Normal mode
+				if (needWaitForReceived)
+				{
+					if (conns[currentActiveConnect].received)
+					{
+						conns[currentActiveConnect].received = false;
+						SendImageDataToClient(img, conns[currentActiveConnect].conn);
+						currentActiveConnect++;
+					}
+					else
+					{
+						currentWaitFrame++;
+						if (currentWaitFrame > maxFrameToWait)
+						{
+							conns[currentActiveConnect].received = false;
+							SendImageDataToClient(img, conns[currentActiveConnect].conn);
+							currentActiveConnect++;
+							currentWaitFrame = 0;
+						}
+					}
+				}
+				else
+				{
+					SendImageDataToClient(img, conns[currentActiveConnect].conn);
+					currentActiveConnect++;
+				}
 
-					  if (conns.size() == 0) return;
-					  //===========================================================================
-					  // check for active connect valid
-					  if (currentActiveConnect == -1)
-					  {
-						  if (conns.size() > 0) currentActiveConnect = 0;
-						  else return;
-					  }
-					  if (currentActiveConnect >= conns.size()) currentActiveConnect = 0;
-					  //===========================================================================
-					  if (needWaitForReceived)
-					  {
-						  if (conns[currentActiveConnect].received)
-						  {
-							  conns[currentActiveConnect].received = false;
-							  SendImageDataToClient(img, conns[currentActiveConnect].conn);
-							  currentActiveConnect++;
-
-							  //LOG_ERROR << "Send frame to : " << currentActiveConnect << " - switch to next client";
-						  }
-						  else
-						  {
-							  currentWaitFrame++;
-							  if (currentWaitFrame > WAIT_FRAME)
-							  {
-								  conns[currentActiveConnect].received = false;
-								  SendImageDataToClient(img, conns[currentActiveConnect].conn);
-								  currentActiveConnect++;
-								  currentWaitFrame = 0;
-							  }
-						  }
-					  }
-					  else
-					  {
-						  SendImageDataToClient(img, conns[currentActiveConnect].conn);
-						  currentActiveConnect++;
-					  }
-				  }).onMouseChanged([&](const SL::Screen_Capture::Image* img, int x, int y)
-				  {
-				  }).start_capturing();
+				}).start_capturing();
 	framgrabber.setFrameChangeInterval(std::chrono::milliseconds(streamFPS));//100 ms
-	framgrabber.setMouseChangeInterval(std::chrono::milliseconds(streamFPS));//100 ms
 	//framgrabber.pause();
 
 	std::cout << "Select monitor: " << cfgMonitorIndex << std::endl;
@@ -641,7 +816,7 @@ int main(int argc, char** argv)
 	GetIPAddress();
 	std::cout << "-------------------------------------------" << std::endl;
 	std::cout << "Wait for connection..." << std::endl;
-	
+
 	loop.Run();
 
 	return 0;

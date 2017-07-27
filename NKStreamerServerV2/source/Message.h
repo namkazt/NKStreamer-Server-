@@ -68,6 +68,7 @@ private:
 
 public:
 	Message();
+	~Message();
 	int ReadMessageFromData(const char* data, size_t size);
 
 	void Build(const char* content, size_t contentSize, char* dest);
