@@ -7,7 +7,11 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/highgui.hpp>
 #include <opencv2/opencv.hpp>
+
+
 #include <turbojpeg.h>
+#include <webp/encode.h>
+
 
 #include "ScreenCapture.h"
 #include "Message.h"
@@ -25,6 +29,45 @@ using namespace libconfig;
 #define SIZE_3DS_RGB 400*3*240
 #define SIZE_3DS_RGB565 400*2*240
 
+#define FPS_24 41;
+#define FPS_30 33;
+#define FPS_60 16;
+
+/// Creates a bitmask from a bit number.
+#define BIT(n) (1U<<(n))
+enum
+{
+	KEY_A = BIT(0),       ///< A
+	KEY_B = BIT(1),       ///< B
+	KEY_SELECT = BIT(2),       ///< Select
+	KEY_START = BIT(3),       ///< Start
+	KEY_DRIGHT = BIT(4),       ///< D-Pad Right
+	KEY_DLEFT = BIT(5),       ///< D-Pad Left
+	KEY_DUP = BIT(6),       ///< D-Pad Up
+	KEY_DDOWN = BIT(7),       ///< D-Pad Down
+	KEY_R = BIT(8),       ///< R
+	KEY_L = BIT(9),       ///< L
+	KEY_X = BIT(10),      ///< X
+	KEY_Y = BIT(11),      ///< Y
+	KEY_ZL = BIT(14),      ///< ZL (New 3DS only)
+	KEY_ZR = BIT(15),      ///< ZR (New 3DS only)
+	KEY_TOUCH = BIT(20),      ///< Touch (Not actually provided by HID)
+	KEY_CSTICK_RIGHT = BIT(24), ///< C-Stick Right (New 3DS only)
+	KEY_CSTICK_LEFT = BIT(25), ///< C-Stick Left (New 3DS only)
+	KEY_CSTICK_UP = BIT(26), ///< C-Stick Up (New 3DS only)
+	KEY_CSTICK_DOWN = BIT(27), ///< C-Stick Down (New 3DS only)
+	KEY_CPAD_RIGHT = BIT(28),   ///< Circle Pad Right
+	KEY_CPAD_LEFT = BIT(29),   ///< Circle Pad Left
+	KEY_CPAD_UP = BIT(30),   ///< Circle Pad Up
+	KEY_CPAD_DOWN = BIT(31),   ///< Circle Pad Down
+
+							   // Generic catch-all directions
+							   KEY_UP = KEY_DUP | KEY_CPAD_UP,    ///< D-Pad Up or Circle Pad Up
+							   KEY_DOWN = KEY_DDOWN | KEY_CPAD_DOWN,  ///< D-Pad Down or Circle Pad Down
+							   KEY_LEFT = KEY_DLEFT | KEY_CPAD_LEFT,  ///< D-Pad Left or Circle Pad Left
+							   KEY_RIGHT = KEY_DRIGHT | KEY_CPAD_RIGHT, ///< D-Pad Right or Circle Pad Right
+};
+
 //-------------------------------------------------
 // CONFIGURATION VARIABLES
 // should not be const to be edit via client on runtime
@@ -38,7 +81,7 @@ int imageQuality = 40;
 //-------------------------------------------------
 // Capture FPS
 //-------------------------------------------------
-int streamFPS = 16;
+int streamFPS = FPS_60;
 
 //-------------------------------------------------
 // this option only good for play game ( that need mininum delay )
@@ -55,7 +98,15 @@ int maxFrameToWait = INT_MAX;
 //-------------------------------------------------
 // Split frame mode
 //-------------------------------------------------
-bool splitFrameMode = false;
+bool splitFrameMode = true;
+
+//-------------------------------------------------
+// Mouse speed
+//-------------------------------------------------
+int mouseSpeed = 15;
+int cpadDeadZone = 15;
+int cpadMin = 0;
+int cpadMax = 156;
 
 //-------------------------------------------------
 // Private variables
@@ -76,13 +127,16 @@ bool isStreamingDesktop = false;
 int currentActiveConnect = -1;
 int currentFrame = 0;
 int currentWaitFrame = 0;
+bool isSentProfile = false;
 
-Message* receivedMessage = nullptr;
 std::mutex msgMutex;
+Message* receivedMessage = nullptr;
+Message* receivedMessageMain = nullptr;
 
 SL::Screen_Capture::ScreenCaptureManager framgrabber;
 int connectionCount;
 std::vector<ClientConnection> conns;
+ClientConnection mainConn;
 
 std::map<int, std::vector<char*>> framePieceCached;
 std::map<int, int> framePieceState;
@@ -92,8 +146,16 @@ char totalConn;
 //=================================================================================
 // KEY MAPPING
 //=================================================================================
+struct MappingProfile
+{
+	std::string name = "";
+	std::map<uint8_t, FakeInput::Key> mappings;
+	bool mouseSupport = false;
+};
+
 static std::string currentProfile = "";
-static std::map<std::string, std::map<char, FakeInput::Key>> MappingProfiles;
+static std::map<std::string, MappingProfile> MappingProfiles;
+static std::vector<std::string> ProfilesHolder;
 static std::map<std::string, FakeInput::Key> KeyMapping;
 
 void MapKey()
@@ -243,20 +305,31 @@ void SendImageDataToClient(const SL::Screen_Capture::Image& img, evpp::TCPConnPt
 		return;
 	}
 	//-----------------------------------------------------------------------------
-	// encrypt to JPEG small
+	// encryption
 	//-----------------------------------------------------------------------------
 	cv::Mat rawImg = cv::Mat(cv::Size(Width(img), Height(img)), CV_8UC3, imgbuffer);
 	cv::Mat scaledImg;
 	cv::resize(rawImg, scaledImg, cv::Size(400, 240));
-	long unsigned int _jpegSize = 0;
+	//---------------------------------
+	// JPEG
+	long unsigned int imgSize = 0;
 	unsigned char* _compressedImage = NULL;
 	tjhandle _jpegCompressor = tjInitCompress();
-	tjCompress2(_jpegCompressor, scaledImg.data, 400, 0, 240, TJPF_RGB, &_compressedImage, &_jpegSize, TJSAMP_444, imageQuality, TJFLAG_FASTDCT);
+	tjCompress2(_jpegCompressor, scaledImg.data, 400, 0, 240, TJPF_RGB, &_compressedImage, &imgSize, TJSAMP_444, imageQuality, TJFLAG_FASTDCT);
+	if(imgSize == 0)
+	{
+		free(imgbuffer);
+		tjDestroy(_jpegCompressor);
+		tjFree(_compressedImage);
+		scaledImg.release();
+		rawImg.release();
+		return;
+	}
 	//-----------------------------------------------------------------------------
 	// build Message
 	//-----------------------------------------------------------------------------
 	// header size = 1 + 4 + 4 = 9 -> 1 byte code + 4 bytes content size + 4 bytes frame
-	int totalSize = _jpegSize + 9;
+	int totalSize = imgSize + 9;
 	Message* msg = new Message();
 	msg->MessageCode = IMAGE_PACKET;
 	msg->ContentSize = totalSize;
@@ -278,12 +351,11 @@ void SendImageDataToClient(const SL::Screen_Capture::Image& img, evpp::TCPConnPt
 	*data++ = currentFrame >> 16;
 	*data++ = currentFrame >> 24;
 	//--------------------------------------
-	memcpy(data, _compressedImage, _jpegSize);
-	std::cout << "Frame Index: " << currentFrame << " MSG size: " << totalSize << std::endl;
+	memcpy(data, _compressedImage, imgSize);
+	//std::cout << "[Static Frame] index: " << currentFrame << " MSG size: " << totalSize << std::endl;
 	//-----------------------------------------------------------------------------
 	// Send message to all client
 	//-----------------------------------------------------------------------------
-	//if (conn3ds != nullptr) conn3ds->Send(msgContent, totalSize);
 	conn3ds->Send(msgContent, totalSize);
 	//-----------------------------------------------------------------------------
 	// advance to next frame or recircle back to 0 when reach max.
@@ -294,12 +366,13 @@ void SendImageDataToClient(const SL::Screen_Capture::Image& img, evpp::TCPConnPt
 	// free msg data
 	//-----------------------------------------------------------------------------
 	free(msgContent);
-	msg->Release();
 	delete msg;
 	//-----------------------------------------------------------------------------
 	free(imgbuffer);
 	tjDestroy(_jpegCompressor);
 	tjFree(_compressedImage);
+	scaledImg.release();
+	rawImg.release();
 }
 
 //-----------------------------------------------------------------------------
@@ -307,11 +380,11 @@ void SendImageDataToClient(const SL::Screen_Capture::Image& img, evpp::TCPConnPt
 // return True if frame sent and erased
 bool CleanFrameCached(int frameIndex)
 {
-	if(framePieceState.find(frameIndex) != framePieceState.end())
+	if (framePieceState.find(frameIndex) != framePieceState.end())
 	{
-		if(framePieceState[frameIndex] == totalConn)
+		if (framePieceState[frameIndex] == totalConn)
 		{
-			for(char i = 0; i < totalConn; i++)
+			for (char i = 0; i < totalConn; i++)
 			{
 				free(framePieceCached[frameIndex][i]);
 			}
@@ -333,7 +406,7 @@ int PopOutOnePiece(int frameIndex)
 		int ret = framePieceState[frameIndex];
 		framePieceState[frameIndex]++;
 		return ret;
-	} 
+	}
 	return -1;
 }
 
@@ -366,7 +439,6 @@ void GetFramePieces(const SL::Screen_Capture::Image& img)
 	unsigned char* _compressedImage = NULL;
 	tjhandle _jpegCompressor = tjInitCompress();
 	tjCompress2(_jpegCompressor, scaledImg.data, 400, 0, 240, TJPF_RGB, &_compressedImage, &_jpegSize, TJSAMP_444, imageQuality, TJFLAG_FASTDCT);
-
 	//-----------------------------------------------------------------------------
 	// collect split information
 	//-----------------------------------------------------------------------------
@@ -374,12 +446,12 @@ void GetFramePieces(const SL::Screen_Capture::Image& img)
 	framePieceLast = _jpegSize - (framePieceNormal * totalConn) + framePieceNormal;
 
 	std::vector<char*> frameCached;
-	for(char i = 0; i < totalConn; ++i)
+	for (char i = 0; i < totalConn; ++i)
 	{
 		//-----------------------------------------------------------------------------
 		// build Message
 		//-----------------------------------------------------------------------------
-		// header size = 1 + 4 + 4 = 9 -> 1 byte code + 4 bytes content size + 4 bytes frame
+		// header size = 1 + 4 + 4 + 2 = 11 -> 1 byte code + 4 bytes content size + 4 bytes frame + 1 byte total part + 1 byte part index
 		int totalSize = 11;
 		if (i == totalConn - 1) totalSize += framePieceLast;
 		else totalSize += framePieceNormal;
@@ -424,92 +496,212 @@ void GetFramePieces(const SL::Screen_Capture::Image& img)
 	framePieceState[currentFrame] = 0;
 	//-----------------------------------------------------------------------------
 	free(imgbuffer);
+	tjDestroy(_jpegCompressor);
+	tjFree(_compressedImage);
+	scaledImg.release();
+	rawImg.release();
 }
 
 void ProcessInput(const Message* message, ClientConnection* clientConnect)
 {
-	//------------------------------------------------------------
-	// input code from 70 to 85 is normal input mapping
-	if (message->MessageCode >= char(70) && message->MessageCode <= char(85))
+	int cursor = 0;
+	//----------------------------------
+	// down event
+	uint32_t downEvent = (uint32_t)message->Content[cursor] |
+		(uint32_t)message->Content[cursor + 1] << 8 |
+		(uint32_t)message->Content[cursor + 2] << 16 |
+		(uint32_t)message->Content[cursor + 3] << 24;
+	cursor += 4;
+	//----------------------------------
+	// up event
+	uint32_t upEvent = (uint32_t)message->Content[cursor] |
+		(uint32_t)message->Content[cursor + 1] << 8 |
+		(uint32_t)message->Content[cursor + 2] << 16 |
+		(uint32_t)message->Content[cursor + 3] << 24;
+	cursor += 4;
+	//----------------------------------------------------------------
+	for (uint8_t i = 0; i < 32; ++i)
 	{
-		char state = message->GetFirstByte();
-		if (state == char(1))
+		if (downEvent & BIT(i))
 		{
-			FakeInput::Keyboard::pressKey(MappingProfiles[currentProfile][message->MessageCode]);
+			if (MappingProfiles[currentProfile].mouseSupport && (i == 14 || i == 15))
+			{
+				if (i == 14)
+					FakeInput::Mouse::pressButton(FakeInput::Mouse_Left);
+				else
+					FakeInput::Mouse::pressButton(FakeInput::Mouse_Right);
+			}
+			else
+			{
+				if (MappingProfiles[currentProfile].mappings.find(i) != MappingProfiles[currentProfile].mappings.end())
+					FakeInput::Keyboard::pressKey(MappingProfiles[currentProfile].mappings[i]);
+			}
 		}
-		else
+		if (upEvent & BIT(i))
 		{
-			FakeInput::Keyboard::releaseKey(MappingProfiles[currentProfile][message->MessageCode]);
+			if (MappingProfiles[currentProfile].mouseSupport && (i == 14 || i == 15))
+			{
+				if (i == 14)
+					FakeInput::Mouse::releaseButton(FakeInput::Mouse_Left);
+				else
+					FakeInput::Mouse::releaseButton(FakeInput::Mouse_Right);
+			}
+			else {
+				if (MappingProfiles[currentProfile].mappings.find(i) != MappingProfiles[currentProfile].mappings.end())
+					FakeInput::Keyboard::releaseKey(MappingProfiles[currentProfile].mappings[i]);
+			}
 		}
 	}
-	else if (message->MessageCode > char(85) && message->MessageCode <= char(90))
-	{
-		//-----------------------------------------------------
-		// input code from 86 to 90 is for circle pad
 
-		std::cout << "Circle pad input is not implement yet!" << std::endl;
+	if (MappingProfiles[currentProfile].mouseSupport) {
+		//----------------------------------
+		// circle pad X
+		uint8_t cPadX = (uint8_t)message->Content[cursor];
+		uint8_t cPadX_Dir = (uint8_t)message->Content[cursor + 1];
+		cursor += 2;
+		//----------------------------------
+		// circle pad Y
+		uint8_t cPadY = (uint8_t)message->Content[cursor];
+		uint8_t cPadY_Dir = (uint8_t)message->Content[cursor + 1];
+		cursor += 2;
+
+		int finalDX = cPadX;
+		int finalDY = cPadY;
+		//----------------------------------------------------------------
+		int mouseX = 0;
+		int mouseY = 0;
+		if (finalDX > cpadDeadZone)
+		{
+			int16_t moveX = finalDX - cpadDeadZone;
+			if (moveX < 0) moveX = 0;
+			float deltaX = float(moveX) / float(cpadMax - cpadDeadZone);
+			int dir = cPadX_Dir > 0 ? 1 : -1;
+			mouseX = deltaX * mouseSpeed * dir;
+		}
+		if (finalDY > cpadDeadZone)
+		{
+			int16_t moveY = finalDY - cpadDeadZone;
+			if (moveY < 0) moveY = 0;
+			float deltaY = float(moveY) / float(cpadMax - cpadDeadZone);
+			int dir = cPadY_Dir > 0 ? -1 : 1;
+			mouseY = deltaY * mouseSpeed * dir;
+		}
+		if (mouseX != 0 || mouseY != 0)
+		{
+			FakeInput::Mouse::move(mouseX, mouseY);
+		}
 	}
 }
 
 void ProcessMessage(const Message* message, ClientConnection* clientConnect)
 {
+	if (message == nullptr) return;
+
 	switch (message->MessageCode)
 	{
 	case START_STREAM_PACKET:
-		{
+	{
 		std::cout << "Client start streaming" << std::endl;
-			totalConn = conns.size();
-			//---------------------------------
-			// Client what start the stream is main
-			//---------------------------------
-			clientConnect->isMainConnect = true;
-			isStreamingDesktop = true;
-			currentFrame = 0;
-			if (framgrabber.isPaused()) framgrabber.resume();
-			break;
-		}
+		totalConn = conns.size();
+		//---------------------------------
+		// Client what start the stream is main
+		//---------------------------------
+		clientConnect->isMainConnect = true;
+		isStreamingDesktop = true;
+		currentFrame = 0;
+		if (framgrabber.isPaused()) framgrabber.resume();
+		break;
+	}
 	case STOP_STREAM_PACKET:
-		{
+	{
 		std::cout << "Client stop streaming" << std::endl;
-			//---------------------------------
-			// Only main client can stop stream
-			//---------------------------------
-			if (!clientConnect->isMainConnect) return;
-			isStreamingDesktop = false;
-			framgrabber.pause();
-			break;
-		}
+		//---------------------------------
+		// Only main client can stop stream
+		//---------------------------------
+		if (!clientConnect->isMainConnect) return;
+		isStreamingDesktop = false;
+		framgrabber.pause();
+		break;
+	}
 	case IMAGE_RECEIVED_PACKET:
+	{
+		clientConnect->received = true;
+		break;
+	}
+	case OPT_VIDEO_QUALITY_PACKET:
+	{
+		std::cout << "Client request to change video quality." << std::endl;
+		int state = message->GetFirstInt();
+		//----------------------------------
+		std::cout << "Video quality from " << imageQuality << " to " << state << std::endl;
+		imageQuality = state;
+		//----------------------------------
+		break;
+	}
+	case OPT_STREAM_MODE_PACKET:
+	{
+		std::cout << "Client request to change stream mode." << std::endl;
+		int state = message->GetFirstInt();
+		//----------------------------------
+		if (state == 1)
 		{
-		
-			clientConnect->received = true;
-			break;
+			std::cout << "Stream mode: Video Stream" << std::endl;
+			needWaitForReceived = false;
+			streamFPS = FPS_30;
+			framgrabber.setFrameChangeInterval(std::chrono::milliseconds(streamFPS));//100 ms
 		}
-	case OPTION_PACKET:
+		else
 		{
-			break;
+			std::cout << "Stream mode: Game Stream" << std::endl;
+			needWaitForReceived = true;
+			streamFPS = FPS_60;
+			framgrabber.setFrameChangeInterval(std::chrono::milliseconds(streamFPS));//100 ms
 		}
-	default:
+		//----------------------------------
+		break;
+	}
+	case OPT_FPS_MODE_PACKET:
+	{
+		std::cout << "Client request to change fps mode." << std::endl;
+		int state = message->GetFirstInt();
+		//----------------------------------
+		if (state == 0) streamFPS = FPS_60;
+		if (state == 1) streamFPS = FPS_30;
+		if (state == 2) streamFPS = FPS_24;
+		framgrabber.setFrameChangeInterval(std::chrono::milliseconds(streamFPS));//100 ms
+																				 //----------------------------------
+		break;
+	}
+	case OPT_CHANGE_INPUT_PROFILE:
+	{
+		int newInput = message->GetFirstInt();
+		if (newInput >= 0 && newInput < ProfilesHolder.size())
 		{
-			ProcessInput(message, clientConnect);
-			break;
+			currentProfile = ProfilesHolder[newInput];
+			std::cout << "Client request change input profile to: " << currentProfile << std::endl;
 		}
+		break;
+	}
+	case INPUT_PACKET_FRAME:
+	{
+		ProcessInput(message, clientConnect);
+		break;
+	}
 	}
 }
 
 void ProcessData(const char* buffer, size_t lenght, ClientConnection* clientConnect)
 {
-	msgMutex.lock();
 	if (receivedMessage == nullptr) receivedMessage = new Message();
 	int cutOffset = receivedMessage->ReadMessageFromData(buffer, lenght);
 	if (cutOffset >= 0)
 	{
 		// Process new message
 		ProcessMessage(receivedMessage, clientConnect);
-
-		delete receivedMessage;
-		receivedMessage = nullptr;
-
+		if (receivedMessage != nullptr) {
+			delete receivedMessage;
+			receivedMessage = nullptr;
+		}
 		if (cutOffset > 0)
 		{
 			// continue process by buffer.
@@ -522,7 +714,31 @@ void ProcessData(const char* buffer, size_t lenght, ClientConnection* clientConn
 			free(bufferLeft);
 		}
 	}
-	msgMutex.unlock();
+}
+void ProcessMainData(const char* buffer, size_t lenght, ClientConnection* clientConnect)
+{
+	if (receivedMessageMain == nullptr) receivedMessageMain = new Message();
+	int cutOffset = receivedMessageMain->ReadMessageFromData(buffer, lenght);
+	if (cutOffset >= 0)
+	{
+		// Process new message
+		ProcessMessage(receivedMessageMain, clientConnect);
+		if (receivedMessageMain != nullptr) {
+			delete receivedMessageMain;
+			receivedMessageMain = nullptr;
+		}
+		if (cutOffset > 0)
+		{
+			// continue process by buffer.
+			int sizeLeft = lenght - cutOffset;
+			char* bufferLeft = (char*)malloc(sizeLeft);
+			memcpy(bufferLeft, buffer + cutOffset, sizeLeft);
+
+			ProcessMainData(bufferLeft, sizeLeft, clientConnect);
+
+			free(bufferLeft);
+		}
+	}
 }
 
 void GetIPAddress()
@@ -587,6 +803,9 @@ int main(int argc, char** argv)
 		if (!serverCfg.lookupValue("monitor", cfgMonitorIndex) || cfgMonitorIndex == -1) cfgMonitorIndex = 0;
 		if (!serverCfg.lookupValue("thread_num", cfgThreadNum) || cfgThreadNum == -1) cfgThreadNum = 3;
 
+		if (!serverCfg.lookupValue("mouse_speed", mouseSpeed) || mouseSpeed == -1) mouseSpeed = 15;
+		if (!serverCfg.lookupValue("circle_pad_deadzone", cpadDeadZone) || cpadDeadZone == -1) cpadDeadZone = 15;
+
 		const Setting& root = serverCfg.getRoot();
 		//===============================
 		// load input profiles
@@ -594,11 +813,14 @@ int main(int argc, char** argv)
 		int inputCount = inputProfiles.getLength();
 		for (int i = 0; i < inputCount; ++i)
 		{
+			MappingProfile profile;
+
 			std::string inputName;
 			std::string btn_A, btn_B, btn_X, btn_Y;
 			std::string btn_DPAD_UP, btn_DPAD_DOWN, btn_DPAD_LEFT, btn_DPAD_RIGHT;
 			std::string btn_L, btn_R, btn_ZL, btn_ZR;
 			std::string btn_START, btn_SELECT;
+			bool mouseSupport;
 
 			if (!(inputProfiles[i].lookupValue("name", inputName) &&
 				inputProfiles[i].lookupValue("btn_A", btn_A) &&
@@ -611,31 +833,41 @@ int main(int argc, char** argv)
 				inputProfiles[i].lookupValue("btn_DPAD_RIGHT", btn_DPAD_RIGHT) &&
 				inputProfiles[i].lookupValue("btn_L", btn_L) &&
 				inputProfiles[i].lookupValue("btn_R", btn_R) &&
-				inputProfiles[i].lookupValue("btn_ZL", btn_ZL) &&
-				inputProfiles[i].lookupValue("btn_ZR", btn_ZR) &&
 				inputProfiles[i].lookupValue("btn_START", btn_START) &&
-				inputProfiles[i].lookupValue("btn_SELECT", btn_SELECT)))
+				inputProfiles[i].lookupValue("btn_SELECT", btn_SELECT) &&
+				inputProfiles[i].lookupValue("mouse_support", mouseSupport)))
 			{
 				continue;
 			}
 
-			std::map<char, FakeInput::Key> profileMap;
-			profileMap[INPUT_PACKET_A] = KeyMapping[btn_A];
-			profileMap[INPUT_PACKET_B] = KeyMapping[btn_B];
-			profileMap[INPUT_PACKET_X] = KeyMapping[btn_X];
-			profileMap[INPUT_PACKET_Y] = KeyMapping[btn_Y];
-			profileMap[INPUT_PACKET_L] = KeyMapping[btn_L];
-			profileMap[INPUT_PACKET_R] = KeyMapping[btn_R];
-			profileMap[INPUT_PACKET_LZ] = KeyMapping[btn_ZL];
-			profileMap[INPUT_PACKET_RZ] = KeyMapping[btn_ZR];
-			profileMap[INPUT_PACKET_UP_D] = KeyMapping[btn_DPAD_UP];
-			profileMap[INPUT_PACKET_DOWN_D] = KeyMapping[btn_DPAD_DOWN];
-			profileMap[INPUT_PACKET_LEFT_D] = KeyMapping[btn_DPAD_LEFT];
-			profileMap[INPUT_PACKET_RIGHT_D] = KeyMapping[btn_DPAD_RIGHT];
-			profileMap[INPUT_PACKET_START] = KeyMapping[btn_START];
-			profileMap[INPUT_PACKET_SELECT] = KeyMapping[btn_SELECT];
+			profile.name = inputName;
+			profile.mouseSupport = mouseSupport;
+			profile.mappings[0] = KeyMapping[btn_A];
+			profile.mappings[1] = KeyMapping[btn_B];
+			profile.mappings[10] = KeyMapping[btn_X];
+			profile.mappings[11] = KeyMapping[btn_Y];
+			profile.mappings[9] = KeyMapping[btn_L];
+			profile.mappings[8] = KeyMapping[btn_R];
+			profile.mappings[6] = KeyMapping[btn_DPAD_UP];
+			profile.mappings[7] = KeyMapping[btn_DPAD_DOWN];
+			profile.mappings[5] = KeyMapping[btn_DPAD_LEFT];
+			profile.mappings[4] = KeyMapping[btn_DPAD_RIGHT];
+			profile.mappings[3] = KeyMapping[btn_START];
+			profile.mappings[2] = KeyMapping[btn_SELECT];
 
-			MappingProfiles[inputName] = profileMap;
+			// if not using cpad as mouse then must set it
+			if (!mouseSupport)
+			{
+				profile.mappings[30] = KeyMapping[btn_DPAD_UP];
+				profile.mappings[31] = KeyMapping[btn_DPAD_DOWN];
+				profile.mappings[29] = KeyMapping[btn_DPAD_LEFT];
+				profile.mappings[28] = KeyMapping[btn_DPAD_RIGHT];
+				profile.mappings[14] = KeyMapping[btn_ZL];
+				profile.mappings[15] = KeyMapping[btn_ZR];
+			}
+
+			ProfilesHolder.push_back(inputName);
+			MappingProfiles[inputName] = profile;
 			if (i == 0) currentProfile = inputName;
 		}
 	}
@@ -653,83 +885,83 @@ int main(int argc, char** argv)
 
 	//===========================================================================
 	framgrabber = SL::Screen_Capture::CreateScreeCapture([&cfgMonitorIndex]()
+	{
+		auto mons = SL::Screen_Capture::GetMonitors();
+		std::vector<SL::Screen_Capture::Monitor> selectedMonitor = std::vector<SL::Screen_Capture::Monitor>();
+		if (cfgMonitorIndex >= mons.size()) cfgMonitorIndex = 0;
+		selectedMonitor.push_back(mons[cfgMonitorIndex]);
+		return selectedMonitor;
+	}).onNewFrame([&](const SL::Screen_Capture::Image& img, const SL::Screen_Capture::Monitor& monitor)
+	{
+		if (conns.size() == 0) return;
+		if (!isStreamingDesktop) return;
+		//===========================================================================
+		// check for active connect valid
+		if (currentActiveConnect == -1)
+		{
+			if (conns.size() > 0) currentActiveConnect = 0;
+			else return;
+		}
+		if (currentActiveConnect >= conns.size()) currentActiveConnect = 0;
+		//===========================================================================
+		// Split frame mode
+		if (splitFrameMode)
+		{
+			// loop in each conn and check
+			for (int i = 0; i < conns.size(); i++)
 			{
-				auto mons = SL::Screen_Capture::GetMonitors();
-				std::vector<SL::Screen_Capture::Monitor> selectedMonitor = std::vector<SL::Screen_Capture::Monitor>();
-				if (cfgMonitorIndex >= mons.size()) cfgMonitorIndex = 0;
-				selectedMonitor.push_back(mons[cfgMonitorIndex]);
-				return selectedMonitor;
-			}).onNewFrame([&](const SL::Screen_Capture::Image& img, const SL::Screen_Capture::Monitor& monitor)
+				// send this part of
+				if (conns[i].received)
 				{
-				if (conns.size() == 0) return;
-				if (!isStreamingDesktop) return;
-				//===========================================================================
-				// check for active connect valid
-				if (currentActiveConnect == -1)
-				{
-					if (conns.size() > 0) currentActiveConnect = 0;
-					else return;
-				}
-				if (currentActiveConnect >= conns.size()) currentActiveConnect = 0;
-				//===========================================================================
-				// Split frame mode
-				if (splitFrameMode)
-				{
-					// loop in each conn and check
-					for (int i = 0; i < totalConn; i++)
-					{
-						// send this part of
-						if (conns[i].received)
-						{
-							int currentPieceIdx = PopOutOnePiece(currentFrame);
-							if (currentPieceIdx == -1) {
-								CleanFrameCached(currentFrame);
-								GetFramePieces(img);
-								std::cout << "[New Frame] Frame: " << currentFrame << std::endl;
-								currentPieceIdx = PopOutOnePiece(currentFrame);
-							}
-						
-							conns[i].received = false;
-							conns[i].currentFrame = currentFrame;
-							conns[i].pieceIndex = currentPieceIdx;
-							int size = (currentPieceIdx == totalConn - 1 ? framePieceLast : framePieceNormal) + 11;
-							conns[i].conn->Send(framePieceCached[currentFrame][currentPieceIdx], size);
-							std::cout << "[Peak] piece index: " << currentPieceIdx << " in frame: " << currentFrame << " size: " << size << std::endl;
-						}
+					int currentPieceIdx = PopOutOnePiece(currentFrame);
+					if (currentPieceIdx == -1) {
+						CleanFrameCached(currentFrame);
+						GetFramePieces(img);
+						std::cout << "[New Frame] Frame: " << currentFrame << std::endl;
+						currentPieceIdx = PopOutOnePiece(currentFrame);
 					}
-					return;
+
+					conns[i].received = false;
+					conns[i].currentFrame = currentFrame;
+					conns[i].pieceIndex = currentPieceIdx;
+					int size = (currentPieceIdx == totalConn - 1 ? framePieceLast : framePieceNormal) + 11;
+					conns[i].conn->Send(framePieceCached[currentFrame][currentPieceIdx], size);
+					std::cout << "[Peak] piece index: " << currentPieceIdx << " in frame: " << currentFrame << " size: " << size << std::endl;
 				}
-				//===========================================================================
-				// Normal mode
-				if (needWaitForReceived)
+			}
+			return;
+		}
+		//===========================================================================
+		// Normal mode
+		if (needWaitForReceived)
+		{
+			if (conns[currentActiveConnect].received)
+			{
+				conns[currentActiveConnect].received = false;
+				SendImageDataToClient(img, conns[currentActiveConnect].conn);
+				currentActiveConnect++;
+			}
+			else
+			{
+				currentWaitFrame++;
+				if (currentWaitFrame > maxFrameToWait)
 				{
-					if (conns[currentActiveConnect].received)
-					{
-						conns[currentActiveConnect].received = false;
-						SendImageDataToClient(img, conns[currentActiveConnect].conn);
-						currentActiveConnect++;
-					}
-					else
-					{
-						currentWaitFrame++;
-						if (currentWaitFrame > maxFrameToWait)
-						{
-							conns[currentActiveConnect].received = false;
-							SendImageDataToClient(img, conns[currentActiveConnect].conn);
-							currentActiveConnect++;
-							currentWaitFrame = 0;
-						}
-					}
-				}
-				else
-				{
+					conns[currentActiveConnect].received = false;
 					SendImageDataToClient(img, conns[currentActiveConnect].conn);
 					currentActiveConnect++;
+					currentWaitFrame = 0;
 				}
+			}
+		}
+		else
+		{
+			SendImageDataToClient(img, conns[currentActiveConnect].conn);
+			currentActiveConnect++;
+		}
 
-				}).start_capturing();
+	}).start_capturing();
 	framgrabber.setFrameChangeInterval(std::chrono::milliseconds(streamFPS));//100 ms
-	//framgrabber.pause();
+	framgrabber.pause();
 
 	std::cout << "Select monitor: " << cfgMonitorIndex << std::endl;
 	std::cout << "Init Screen Capture : Successfully" << std::endl;
@@ -740,71 +972,106 @@ int main(int argc, char** argv)
 	std::string addr = "0.0.0.0:" + std::to_string(cfgPort);
 	std::cout << "Running on address: " << addr << std::endl;
 	evpp::EventLoop loop;
-	evpp::TCPServer server(&loop, addr, "NKStreamerServer", 6);
+	evpp::TCPServer server(&loop, addr, "NKStreamerServer", cfgThreadNum);
 	server.SetMessageCallback([&](const evpp::TCPConnPtr& conn, evpp::Buffer* msg)
+	{
+		int idx = -1;
+		for (int i = 0; i < conns.size(); i++)
 		{
-			int idx = -1;
-			for (int i = 0; i < conns.size(); i++)
+			if (conns[i].conn->name().compare(conn->name()) == 0)
 			{
-				if (conns[i].conn->name().compare(conn->name()) == 0)
-				{
-					idx = i;
-					break;
-				}
+				idx = i;
+				break;
 			}
-			if (idx > -1)
-			{
-				//std::cout << "Recevied data: " << msg->length() << std::endl;
-				//===========================================================================
-				ProcessData(msg->data(), msg->length(), &conns[idx]);
-				// need reset to empty msg after using.
-				msg->Reset();
-			}
-			else
-			{
-				LOG_ERROR << "Unknow client : " << conn->name() << " send.";
-			}
-		});
+		}
+		//-------------------------------
+		// conn is piece worker
+		if (idx > -1)
+		{
+			//std::cout << "Recv Data On Thread ID: " << std::this_thread::get_id() << std::endl;
+			//===========================================================================
+			msgMutex.lock();
+			ProcessData(msg->data(), msg->length(), &conns[idx]);
+			msgMutex.unlock();
+			// need reset to empty msg after using.
+			msg->Reset();
+		}
+		else
+		{
+			msgMutex.lock();
+			// conn is main
+			ProcessMainData(msg->data(), msg->length(), &mainConn);
+			msgMutex.unlock();
+			msg->Reset();
+		}
+	});
 	server.SetConnectionCallback([&](const evpp::TCPConnPtr& conn)
+	{
+		if (conn->IsConnected())
 		{
-			if (conn->IsConnected())
+			if(mainConn.conn == nullptr)
 			{
-				std::cout << ">> New client connected." << std::endl;
+				mainConn.conn = conn;
+				mainConn.received = true;
+				mainConn.isMainConnect = true;
+				//--------------------------------------
 
-				//LOG_ERROR << "New Client : " << conn->name() << " Connected";
-				//------------------------------
-				// new connection
+				if (!isSentProfile)
+				{
+					isSentProfile = true;
+					//--------------------------------------
+					int totalSize = 5;
+					static std::map<std::string, MappingProfile>::iterator iter;
+					for (iter = MappingProfiles.begin(); iter != MappingProfiles.end(); ++iter)
+						totalSize += iter->first.size() + 1;
+					//--------------------------------------
+					Message* msg = new Message();
+					msg->MessageCode = OPT_RECEIVE_INPUT_PROFILE;
+					msg->ContentSize = totalSize;
+					char* msgContent = (char*)malloc(totalSize);
+					//--------------------------------------
+					char* data = msgContent;
+					*data++ = msg->MessageCode;
+					//--------------------------------------
+					// 4 bytes for content size
+					*data++ = msg->ContentSize;
+					*data++ = msg->ContentSize >> 8;
+					*data++ = msg->ContentSize >> 16;
+					*data++ = msg->ContentSize >> 24;
+
+					int cursor = 0;
+					for (iter = MappingProfiles.begin(); iter != MappingProfiles.end(); ++iter)
+					{
+						uint8_t cs = iter->first.size();
+						*(data + cursor) = cs;
+						memcpy(data + cursor + 1, iter->first.c_str(), cs);
+						cursor += cs + 1;
+					}
+					conn->Send(msgContent, totalSize);
+				}
+			}else
+			{
 				ClientConnection client;
 				client.conn = conn;
 				client.received = true;
 				client.isMainConnect = false;
 				conns.push_back(client);
 			}
-			else
+			
+		}
+		else
+		{
+			//------------------------------
+			// stop stream when no connection
+			if (conns.size() > 0)
 			{
-				std::cout << ">> client disconnected." << std::endl;
-				//LOG_ERROR << "Client : " << conn->name() << " Disconnected";
-				//------------------------------
-				// client disconect
-				int idx = -1;
-				for (int i = 0; i < conns.size(); i++)
-				{
-					if (conns[i].conn->name().compare(conn->name()) == 0)
-					{
-						idx = i;
-						break;
-					}
-				}
-				conns.erase(conns.begin() + idx);
-				//------------------------------
-				// stop stream when no connection
-				if (conns.size() == 0)
-				{
-					isStreamingDesktop = false;
-					framgrabber.pause();
-				}
+				std::vector<ClientConnection>().swap(conns);
+				isSentProfile = false;
+				isStreamingDesktop = false;
+				framgrabber.pause();
 			}
-		});
+		}
+	});
 	server.Init();
 	server.Start();
 

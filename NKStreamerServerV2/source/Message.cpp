@@ -32,7 +32,7 @@ int Message::ReadMessageFromData(const char* data, size_t size)
 			return 0;
 		}
 		//---------------------------------------
-		Content = (char*)malloc(ContentSize);
+		Content = (char*)malloc(sizeof(char) * ContentSize);
 		if (ContentSize >= size)
 		{
 			memcpy(Content, data + 5, (size - 5));
@@ -65,28 +65,6 @@ int Message::ReadMessageFromData(const char* data, size_t size)
 	return -1;
 }
 
-void Message::Build(const char* content, size_t contentSize, char* dest)
-{
-	dest = (char*)malloc(contentSize);
-	//--------------------------------------
-	char* data = dest;
-	*data++ = this->MessageCode;
-	*data++ = this->ContentSize;
-	*data++ = this->ContentSize >> 8;
-	*data++ = this->ContentSize >> 16;
-	*data++ = this->ContentSize >> 24;
-	memcpy(data, content, contentSize);
-}
-
-void Message::Release()
-{
-	if (this->Content != nullptr)
-	{
-		free(this->Content);
-		this->Content = nullptr;
-	}
-}
-
 //-----------------------
 // input package helper
 //-----------------------
@@ -100,10 +78,21 @@ char Message::GetFirstByte() const
 	return 0;
 }
 
+int Message::GetFirstInt() const
+{
+	if (this->Content != nullptr && this->ContentSize > 5 && this->MessageCode != IMAGE_PACKET)
+	{
+		int value = (uint32_t)this->Content[0] |
+			(uint32_t)this->Content[1] << 8 |
+			(uint32_t)this->Content[2] << 16 |
+			(uint32_t)this->Content[3] << 24;
+		return value;
+	}
+	return -1;
+}
+
 Message::~Message()
 {
-	if(Received > 5)
-	{
+	if(this->Content != nullptr)
 		free(this->Content);
-	}
 }

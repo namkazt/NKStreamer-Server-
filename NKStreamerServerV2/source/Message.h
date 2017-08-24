@@ -16,13 +16,19 @@
 #define IMAGE_PACKET					30
 #define IMAGE_RECEIVED_PACKET			31
 
-#define OPTION_PACKET					50
+#define OPT_VIDEO_QUALITY_PACKET		100
+#define OPT_STREAM_MODE_PACKET			101
+#define OPT_FPS_MODE_PACKET				102
+#define OPT_RECEIVE_INPUT_PROFILE		103
+#define OPT_CHANGE_INPUT_PROFILE		104
 
 //=================================================================================
 // Each normal input have 1 byte data for
 // 1 -> Press key
 // 2 -> Release Key
 //=================================================================================
+#define INPUT_PACKET_FRAME				90
+
 #define INPUT_PACKET_A					70
 #define INPUT_PACKET_B					71
 #define INPUT_PACKET_X					72
@@ -62,7 +68,6 @@ public:
 	uint8_t MessageCode;
 	uint32_t ContentSize;
 	char* Content = nullptr;
-
 private:
 	uint32_t Received;
 
@@ -70,14 +75,11 @@ public:
 	Message();
 	~Message();
 	int ReadMessageFromData(const char* data, size_t size);
-
-	void Build(const char* content, size_t contentSize, char* dest);
-	void Release();
-
 	//-----------------------
 	// input package helper
 	//-----------------------
 	char GetFirstByte() const;
+	int GetFirstInt() const;
 };
 
 #endif

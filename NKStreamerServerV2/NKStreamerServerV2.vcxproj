@@ -142,8 +142,15 @@
     <ClCompile Include="source\Message.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="resource.h" />
     <ClInclude Include="source\Message.h" />
     <ClInclude Include="source\winmain-inl.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="NKStreamerServerV2.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="icon.ico" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
